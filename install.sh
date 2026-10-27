@@ -8,7 +8,7 @@
 
 set -u
 
-WIN_CMD='powershell -ExecutionPolicy Bypass -c "irm edm.run/win | iex"'
+WIN_CMD='irm edm.run/win | iex   (PowerShell 에 붙여넣기)'
 BIN_DIR="$HOME/.local/bin"
 LOG="$HOME/edm-설치기록.txt"
 BLOCK_BEGIN="# >>> edmakers 설치기 >>>"

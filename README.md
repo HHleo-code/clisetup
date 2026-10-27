@@ -8,10 +8,10 @@ Claude Code · Codex 를 한 줄로 설치합니다. Node·Git 까지 같이 맞
 curl -fsSL edm.run/mac | bash
 ```
 
-## 윈도우 — PowerShell 또는 명령 프롬프트에 붙여넣기
+## 윈도우 — PowerShell 에 붙여넣기 (시작 메뉴에서 "PowerShell" 검색)
 
 ```
-powershell -ExecutionPolicy Bypass -c "irm edm.run/win | iex"
+irm edm.run/win | iex
 ```
 
 실행하면 두 가지를 묻습니다.

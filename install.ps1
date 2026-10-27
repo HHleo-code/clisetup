@@ -1,6 +1,7 @@
 # edmakers AI 도구 설치기 (윈도우)
-# 사용법 (PowerShell·명령 프롬프트 어디서나):
-#   powershell -ExecutionPolicy Bypass -c "irm edm.run/win | iex"
+# 사용법 (PowerShell 에 붙여넣기):
+#   irm edm.run/win | iex
+# 'powershell -ExecutionPolicy Bypass ...' 형태는 백신이 막는 PC 가 있어 쓰지 않는다.
 #
 # Claude Code·Codex 를 공식 설치기로 깔고, Node·Git 까지 관리자 권한 없이 맞춰 둔다.
 # 수업에서 자주 막히던 것(실행 정책·옛 npm 설치·옛 Node·PATH)을 먼저 고친다.
@@ -280,21 +281,28 @@ if ($gitBash) {
 Refresh-SessionPath
 
 # ── 설치 ──────────────────────────────────────────────
-# 공식 설치 스크립트는 끝날 때 exit 를 부르므로, 이 창이 닫히지 않게 별도 PowerShell 로 돌린다
-function Run-Official([string]$url, [string]$name, [hashtable]$envs) {
-    $f = Join-Path $Tmp ("$name-install.ps1")
+# 공식 설치 스크립트는 실패하면 exit 를 부른다. PowerShell 을 새로 띄우면 백신이 '악성 패턴'으로 막는 PC 가 있어서,
+# 같은 프로세스 안의 별도 실행공간(runspace)에서 돌린다. 거기서 exit 해도 이 창은 안 닫힌다.
+# 성공 여부는 종료코드 대신 '실행 파일이 실제로 돌아가는지'로 판단한다.
+function Run-Official([string]$url, [string]$name, [hashtable]$envs, [string]$exe) {
     for ($i = 1; $i -le 3; $i++) {
         Say "  . $name 설치 중... (시도 $i/3, 1~2분 걸려요)"
+        $saved = @{}
         try {
-            Invoke-WebRequest -Uri $url -OutFile $f -UseBasicParsing -TimeoutSec 60
-            $saved = @{}
+            $code = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60).Content
+            if ($code -is [byte[]]) { $code = [Text.Encoding]::UTF8.GetString($code) }
             foreach ($k in $envs.Keys) { $saved[$k] = [Environment]::GetEnvironmentVariable($k, 'Process'); [Environment]::SetEnvironmentVariable($k, $envs[$k], 'Process') }
-            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $f 2>&1 | Out-String | ForEach-Object { L $_ }
-            $code = $LASTEXITCODE
-            foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') }
-            if ($code -eq 0) { return $true }
-            L "$name 시도 $i 종료코드 $code"
+            $ps = [PowerShell]::Create()
+            try {
+                [void]$ps.AddScript($code)
+                $out = $ps.Invoke()
+                L ($out | Out-String)
+                foreach ($s in @($ps.Streams.Information) + @($ps.Streams.Warning) + @($ps.Streams.Error)) { L ([string]$s) }
+            } finally { $ps.Dispose() }
         } catch { L "$name 시도 $i 오류: $($_.Exception.Message)" }
+        finally { foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k], 'Process') } }
+        if ((Test-Path -LiteralPath $exe) -and (& $exe --version 2>$null)) { return $true }
+        L "$name 시도 $i 뒤에도 $exe 가 실행되지 않음"
         Start-Sleep 3
     }
     return $false
@@ -303,16 +311,16 @@ function Run-Official([string]$url, [string]$name, [hashtable]$envs) {
 $ResClaude = $null; $ResCodex = $null
 if ($WantClaude) {
     Step "Claude Code 설치"
-    if (Run-Official 'https://claude.ai/install.ps1' 'Claude Code' @{}) { Ok "Claude Code 설치 끝" } else { Bad "Claude Code 설치 실패" }
+    if (Run-Official 'https://claude.ai/install.ps1' 'Claude Code' @{} (Join-Path $ClaudeBin 'claude.exe')) { Ok "Claude Code 설치 끝" } else { Bad "Claude Code 설치 실패" }
     Add-UserPath $ClaudeBin
 }
 if ($WantCodex) {
     Step "Codex 설치"
-    if (Run-Official 'https://chatgpt.com/codex/install.ps1' 'Codex' @{ CODEX_NON_INTERACTIVE = '1' }) {
+    if (Run-Official 'https://chatgpt.com/codex/install.ps1' 'Codex' @{ CODEX_NON_INTERACTIVE = '1' } (Join-Path $CodexBin 'codex.exe')) {
         Ok "Codex 설치 끝"
     } else {
         Fix "기본 서버가 안 돼서 깃허브 경로로 다시 받습니다"
-        if (Run-Official 'https://chatgpt.com/codex/install.ps1' 'Codex' @{ CODEX_NON_INTERACTIVE = '1'; CODEX_INSTALLER_USE_RELEASES_OPENAI_COM = 'false' }) { Ok "Codex 설치 끝" } else { Bad "Codex 설치 실패" }
+        if (Run-Official 'https://chatgpt.com/codex/install.ps1' 'Codex' @{ CODEX_NON_INTERACTIVE = '1'; CODEX_INSTALLER_USE_RELEASES_OPENAI_COM = 'false' } (Join-Path $CodexBin 'codex.exe')) { Ok "Codex 설치 끝" } else { Bad "Codex 설치 실패" }
     }
     Add-UserPath $CodexBin
 }
