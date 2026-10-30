@@ -89,6 +89,16 @@ WANT_CLAUDE=0; WANT_CODEX=0
 case "$pick" in 1) WANT_CLAUDE=1 ;; 2) WANT_CODEX=1 ;; 3) WANT_CLAUDE=1; WANT_CODEX=1 ;; esac
 say "   선택: $( [ $WANT_CLAUDE = 1 ] && printf 'Claude Code ' )$( [ $WANT_CODEX = 1 ] && printf 'Codex' )"
 
+# ── 3단계: 데이터 분석 도구 ───────────────────────────
+say ""
+say "${B}[3단계] 데이터 분석 도구(파이썬·pandas)도 설치할까요?${N}"
+say "   엑셀·CSV 분석 수업이면 '예'. 2~3분 더 걸려요."
+py_pick="$(ask '   y = 예, 그냥 엔터 = 아니오: ')"
+WANT_PY=0
+case "$py_pick" in y|Y|yes|예|ㅛ) WANT_PY=1 ;; esac
+[ "${EDM_WITH_PY:-0}" = 1 ] && WANT_PY=1
+say "   선택: $( [ $WANT_PY = 1 ] && echo '예' || echo '아니오' )"
+
 # ── 점검·자동 수정 ────────────────────────────────────
 step "설치 전에 컴퓨터를 점검하고, 문제가 있으면 바로 고칩니다"
 
@@ -286,6 +296,26 @@ if [ $WANT_CODEX = 1 ]; then
   fi
 fi
 
+# ── 데이터 분석 도구: 파이썬 3.13 + pandas ──────────────
+# 관리자 권한 없이 uv 로 내 폴더에 파이썬을 깐다. 3.13 고정: 최신판은 pandas 가 아직 안 맞을 수 있다.
+RES_PY=""
+install_python() {
+  if [ ! -x "$BIN_DIR/uv" ]; then
+    curl -LsSf https://astral.sh/uv/install.sh | UV_NO_MODIFY_PATH=1 sh || return 1
+  fi
+  "$BIN_DIR/uv" python install 3.13 --default || return 1
+  # pip install 이 '관리되는 환경' 이라며 거부하지 않게 잠금 파일을 지운다 (내 폴더 전용 파이썬이라 안전)
+  find "$HOME/.local/share/uv/python" -path '*cpython-3.13*' -name EXTERNALLY-MANAGED -delete 2>/dev/null
+  "$BIN_DIR/uv" pip install --system --python "$BIN_DIR/python" pandas openpyxl matplotlib || return 1
+  # 그래프 한글 깨짐 방지
+  mkdir -p "$HOME/.matplotlib"
+  printf 'font.family : AppleGothic\naxes.unicode_minus : False\n' >"$HOME/.matplotlib/matplotlibrc"
+}
+if [ $WANT_PY = 1 ]; then
+  step "데이터 분석 도구(파이썬·pandas) 설치"
+  if run_with_retry "파이썬·pandas" install_python; then ok "파이썬·pandas 설치 끝"; else bad "파이썬·pandas 설치 실패"; fi
+fi
+
 # ── 확인: 새 터미널을 연 것과 똑같이 찾아지는지 ────────
 step "제대로 깔렸는지 확인합니다"
 verify() {  # $1 명령이름  $2 표시이름
@@ -311,6 +341,17 @@ verify() {  # $1 명령이름  $2 표시이름
 }
 [ $WANT_CLAUDE = 1 ] && { verify claude "Claude Code" && RES_CLAUDE=ok || RES_CLAUDE=fail; }
 [ $WANT_CODEX = 1 ]  && { verify codex "Codex" && RES_CODEX=ok || RES_CODEX=fail; }
+if [ $WANT_PY = 1 ]; then
+  pyout="$(cd /tmp && MPLBACKEND=Agg "$BIN_DIR/python" -W error::UserWarning -c "
+import pandas, openpyxl, matplotlib.pyplot as plt, sys
+fig, ax = plt.subplots(); ax.set_title('한글 그래프 확인 -1'); fig.savefig('/tmp/edm-hangul-check.png')
+print(sys.version.split()[0], pandas.__version__)" 2>&1)"; pyrc=$?; pyver="$(echo "$pyout" | tail -n 1)"
+  if [ $pyrc = 0 ]; then
+    ok "파이썬 $(echo "$pyver" | cut -d' ' -f1) / pandas $(echo "$pyver" | cut -d' ' -f2) / 그래프 한글 정상"; RES_PY=ok
+  else
+    bad "파이썬·pandas 확인 실패"; say "$pyout" >>"$LOG"; RES_PY=fail
+  fi
+fi
 node_now="$(PATH="$BIN_DIR:$PATH" command -v node 2>/dev/null)"
 [ -n "$node_now" ] && ok "Node  ${B}$("$node_now" -v)${N} / npm $("$(dirname "$node_now")/npm" -v 2>/dev/null)" || bad "Node: 없음"
 
@@ -319,8 +360,9 @@ say ""
 say "${B}──────────────── 결과 ────────────────${N}"
 [ -n "$RES_CLAUDE" ] && say "  Claude Code : $( [ "$RES_CLAUDE" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
 [ -n "$RES_CODEX" ]  && say "  Codex       : $( [ "$RES_CODEX" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
+[ -n "$RES_PY" ]     && say "  파이썬·pandas: $( [ "$RES_PY" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
 say ""
-if [ "$RES_CLAUDE" != fail ] && [ "$RES_CODEX" != fail ]; then
+if [ "$RES_CLAUDE" != fail ] && [ "$RES_CODEX" != fail ] && [ "$RES_PY" != fail ]; then
   say "  ${B}이제 이 터미널 창을 닫고(⌘Q), 새로 연 다음${N} 아래를 입력하세요."
   [ $WANT_CLAUDE = 1 ] && say "     ${B}claude${N}"
   [ $WANT_CODEX = 1 ]  && say "     ${B}codex${N}"

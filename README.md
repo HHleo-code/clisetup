@@ -14,10 +14,11 @@ curl -fsSL edm.run/mac | bash
 irm edm.run/win | iex
 ```
 
-실행하면 두 가지를 묻습니다.
+실행하면 세 가지를 묻습니다.
 
 1. 어떤 컴퓨터인가요? (맥 / 윈도우)
 2. 무엇을 설치할까요? (Claude Code / Codex / 둘 다)
+3. 데이터 분석 도구(파이썬 3.13 · pandas · openpyxl · matplotlib)도 설치할까요? (엑셀·CSV 분석 수업이면 예)
 
 설치가 끝나면 창을 닫고 새로 연 뒤 `claude` 또는 `codex` 를 입력하세요.
 문제가 생기면 홈 폴더의 `edm-설치기록.txt` 를 강사에게 보여 주세요.

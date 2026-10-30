@@ -100,6 +100,14 @@ $WantClaude = $pick -in @('1', '3')
 $WantCodex  = $pick -in @('2', '3')
 L "   선택: Claude=$WantClaude Codex=$WantCodex"
 
+# ── 3단계: 데이터 분석 도구 ───────────────────────────
+Say ""
+Say "[3단계] 데이터 분석 도구(파이썬·pandas)도 설치할까요?" 'White'
+Say "   엑셀·CSV 분석 수업이면 '예'. 2~3분 더 걸려요."
+$pyPick = Read-Host "   y = 예, 그냥 엔터 = 아니오"
+$WantPy = ($pyPick -match '^(y|Y|yes|예|ㅛ)$') -or ($env:EDM_WITH_PY -eq '1')
+L "   선택: Python=$WantPy"
+
 # ── 점검·자동 수정 ────────────────────────────────────
 Step "설치 전에 컴퓨터를 점검하고, 문제가 있으면 바로 고칩니다"
 
@@ -324,6 +332,40 @@ if ($WantCodex) {
     }
     Add-UserPath $CodexBin
 }
+# ── 데이터 분석 도구: 파이썬 3.13 + pandas ──────────────
+# 관리자 권한 없이 uv 로 내 폴더에 파이썬을 깐다. 3.13 고정: 최신판은 pandas 가 아직 안 맞을 수 있다.
+# 내 폴더의 python.exe 가 사용자 PATH 앞에 오므로, 'python' 치면 스토어가 열리던 가짜 python 도 함께 해결된다.
+$ResPy = $null
+$UvExe = Join-Path $ClaudeBin 'uv.exe'
+$PyExe = Join-Path $ClaudeBin 'python.exe'
+function Install-Python {
+    if (-not (Test-Path -LiteralPath $UvExe)) {
+        if (-not (Run-Official 'https://astral.sh/uv/install.ps1' 'uv' @{ UV_NO_MODIFY_PATH = '1'; UV_INSTALL_DIR = $ClaudeBin } $UvExe)) { throw "uv 설치 실패" }
+    }
+    & $UvExe python install 3.13 --default 2>&1 | Out-String | ForEach-Object { L $_ }
+    if (-not (Test-Path -LiteralPath $PyExe)) { throw "python.exe 가 생기지 않음" }
+    # pip install 이 '관리되는 환경' 이라며 거부하지 않게 잠금 파일을 지운다 (내 폴더 전용 파이썬이라 안전)
+    $pyRoot = (& $UvExe python dir 2>$null | Select-Object -First 1)
+    if ($pyRoot -and (Test-Path -LiteralPath $pyRoot)) {
+        Get-ChildItem -LiteralPath $pyRoot -Recurse -Filter 'EXTERNALLY-MANAGED' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+    & $UvExe pip install --system --python $PyExe pandas openpyxl matplotlib 2>&1 | Out-String | ForEach-Object { L $_ }
+    if ($LASTEXITCODE -ne 0) { throw "pandas 설치 실패 (종료코드 $LASTEXITCODE)" }
+    # 그래프 한글 깨짐 방지
+    $mpl = Join-Path $env:USERPROFILE '.matplotlib'
+    New-Item -ItemType Directory -Force -Path $mpl | Out-Null
+    [IO.File]::WriteAllText((Join-Path $mpl 'matplotlibrc'), "font.family : Malgun Gothic`naxes.unicode_minus : False`n")
+}
+if ($WantPy) {
+    Step "데이터 분석 도구(파이썬·pandas) 설치"
+    $done = $false
+    for ($i = 1; $i -le 3 -and -not $done; $i++) {
+        Say "  . 파이썬·pandas 설치 중... (시도 $i/3, 2~3분 걸려요)"
+        try { Install-Python; $done = $true } catch { L "파이썬 시도 $i 실패: $($_.Exception.Message)"; Start-Sleep 3 }
+    }
+    if ($done) { Ok "파이썬·pandas 설치 끝" } else { Bad "파이썬·pandas 설치 실패" }
+    Add-UserPath $ClaudeBin
+}
 Refresh-SessionPath
 
 # ── 확인: 새 터미널을 연 것과 같은 순서로 찾아지는지 ───
@@ -349,6 +391,22 @@ function Verify([string]$cmd, [string]$label, [string]$expectDir) {
 }
 if ($WantClaude) { $ResClaude = Verify 'claude' 'Claude Code' $ClaudeBin }
 if ($WantCodex)  { $ResCodex  = Verify 'codex' 'Codex' $CodexBin }
+if ($WantPy) {
+    $ResPy = $false
+    if (Test-Path -LiteralPath $PyExe) {
+        $chk = Join-Path $env:TEMP 'edm-hangul-check.py'
+        [IO.File]::WriteAllText($chk, "import pandas, openpyxl, sys`nimport matplotlib`nmatplotlib.use('Agg')`nimport matplotlib.pyplot as plt`nfig, ax = plt.subplots(); ax.set_title('한글 그래프 확인 -1'); fig.savefig(r'$env:TEMP\edm-hangul-check.png')`nprint(sys.version.split()[0], pandas.__version__)`n", (New-Object Text.UTF8Encoding($false)))
+        $pyOut = & $PyExe -W error::UserWarning $chk 2>&1 | Out-String
+        $pyRc = $LASTEXITCODE
+        L $pyOut
+        if ($pyRc -eq 0) {
+            $last = (($pyOut.Trim() -split "`n") | Select-Object -Last 1).Trim().Split(' ')
+            Ok "파이썬 $($last[0]) / pandas $($last[1]) / 그래프 한글 정상"; $ResPy = $true
+        } else { Bad "파이썬·pandas 확인 실패" }
+        $hit = Resolve-NewTerminal 'python'
+        if ($hit -and -not $hit.StartsWith($ClaudeBin, [StringComparison]::OrdinalIgnoreCase)) { Fix "새 창에서 다른 파이썬($hit)이 먼저 잡혀요. 'py' 대신 'python' 으로 쓰면 이 컴퓨터의 다른 파이썬이 실행될 수 있어요." }
+    } else { Bad "파이썬: 실행 파일이 없어요" }
+}
 $n = Resolve-NewTerminal 'node'
 if ($n) { Ok "Node  $(& $n -v)" } else { Bad "Node: 없음" }
 
@@ -358,8 +416,9 @@ Say ""
 Say "---------------- 결과 ----------------" 'White'
 if ($WantClaude) { if ($ResClaude) { Say "  Claude Code : 성공" 'Green' } else { Say "  Claude Code : 실패" 'Red' } }
 if ($WantCodex)  { if ($ResCodex)  { Say "  Codex       : 성공" 'Green' } else { Say "  Codex       : 실패" 'Red' } }
+if ($WantPy)     { if ($ResPy)     { Say "  파이썬·pandas: 성공" 'Green' } else { Say "  파이썬·pandas: 실패" 'Red' } }
 Say ""
-if (($ResClaude -ne $false) -and ($ResCodex -ne $false)) {
+if (($ResClaude -ne $false) -and ($ResCodex -ne $false) -and ($ResPy -ne $false)) {
     Say "  이제 이 창을 닫고, PowerShell 을 새로 연 다음 아래를 입력하세요." 'White'
     if ($WantClaude) { Say "     claude" 'White' }
     if ($WantCodex)  { Say "     codex" 'White' }
