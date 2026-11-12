@@ -13,6 +13,11 @@ BIN_DIR="$HOME/.local/bin"
 LOG="$HOME/edm-설치기록.txt"
 BLOCK_BEGIN="# >>> edmakers 설치기 >>>"
 BLOCK_END="# <<< edmakers 설치기 <<<"
+VER="2026-11-13"
+REPORT_URL="${EDM_REPORT_URL:-https://edm.run/api/install-report}"
+MODE="install"
+CODEX_CFG=""
+RES_CLAUDE=""; RES_CODEX=""; RES_PY=""
 
 # ── 화면 ──────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -36,6 +41,138 @@ ask() {
   printf '%s' "$answer"
 }
 
+# ── 결과 보고 ────────────────────────────────────────────
+# 설치기록을 edm.run 으로 보내고 접수번호를 받는다. 홈 경로·사용자 이름은 가린다. EDM_NO_REPORT=1 이면 안 보냄.
+REPORT_CODE=""
+send_report() {  # $1 ok|fail
+  [ "${EDM_NO_REPORT:-0}" = 1 ] && return 1
+  local f size
+  f="$(mktemp)"
+  size="$(wc -c <"$LOG" | tr -d ' ')"
+  {
+    if [ "$size" -gt 180000 ]; then head -c 24000 "$LOG"; printf '\n...(중간 생략)...\n'; tail -c 150000 "$LOG"; else cat "$LOG"; fi
+  } | sed $'s/\033\\[[0-9;]*m//g' \
+    | awk -v h="$HOME" -v u="$(whoami)" '{
+        while ((i = index($0, h)) > 0) $0 = substr($0, 1, i - 1) "~" substr($0, i + length(h))
+        if (length(u) >= 3) while ((i = index($0, u)) > 0) $0 = substr($0, 1, i - 1) "<사용자>" substr($0, i + length(u))
+        print }' >"$f"
+  REPORT_CODE="$(curl -fsS --max-time 15 -X POST -H 'Content-Type: text/plain; charset=utf-8' --data-binary @"$f" \
+    "$REPORT_URL?os=mac&mode=$MODE&result=$1&claude=$RES_CLAUDE&codex=$RES_CODEX&py=$RES_PY&codexcfg=$CODEX_CFG&ver=$VER" 2>>"$LOG" | tr -d '[:space:]')"
+  rm -f "$f"
+  case "$REPORT_CODE" in [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9]*) return 0 ;; esac
+  REPORT_CODE=""; return 1
+}
+
+# ── Codex 설정 점검·수리 ─────────────────────────────────
+# 설치 뒤에 Codex 가 설정 파일 오류로 아예 안 켜지는 일이 있다 (예: 깨진 폴더 이름 '??' 가 와일드카드로 읽혀 거부됨).
+# Codex 자신에게 설정을 읽혀 보고(features list), 오류 문장에 찍힌 경로를 찾아 고친다.
+find_codex() {
+  if [ -x "$BIN_DIR/codex" ]; then printf '%s' "$BIN_DIR/codex"; return 0; fi
+  command -v codex 2>/dev/null
+}
+codex_cfg_err() {  # 오류가 있으면 0 + 오류 문장 출력
+  local out
+  out="$("$1" features list 2>&1 </dev/null)"
+  if printf '%s' "$out" | grep -Eiq 'error loading configuration|failed to load (bootstrap )?configuration'; then
+    printf '%s' "$out" | tr '\n' ' '; return 0
+  fi
+  return 1
+}
+# 깨진 경로가 든 줄을 끈다 (키 줄이면 주석 처리, 배열 안이면 그 항목만 뺀다)
+codex_off_path() {  # $1 설정파일  $2 경로   → 바꾼 게 있으면 0
+  local tmp; tmp="$(mktemp)"
+  awk -v p="$2" '
+    BEGIN { q1 = "\"" p "\""; q2 = "\047" p "\047"; hit = 0 }
+    {
+      t = $0; sub(/^[ \t]+/, "", t)
+      if (substr(t, 1, 1) != "#" && (index($0, q1) || index($0, q2))) {
+        hit = 1
+        c = substr(t, 1, 1)
+        if (c == "\"" || c == "\047") { print "# edmakers 설치기가 끔 (깨진 경로): " $0; next }
+        while ((i = index($0, q1)) > 0) $0 = substr($0, 1, i - 1) substr($0, i + length(q1))
+        while ((i = index($0, q2)) > 0) $0 = substr($0, 1, i - 1) substr($0, i + length(q2))
+        gsub(/\[[ \t]*,/, "[", $0); gsub(/,[ \t]*,/, ",", $0)
+      }
+      print
+    }
+    END { exit hit ? 0 : 1 }' "$1" >"$tmp" && { cat "$tmp" >"$1"; rm -f "$tmp"; return 0; }
+  rm -f "$tmp"; return 1
+}
+# Codex 는 기본으로 작업 중 인터넷을 막는다. 작업 폴더 밖 쓰기 금지는 두고 인터넷만 연다. 바꿀 게 없으면 1
+codex_net_text() {  # $1 설정파일  $2 새 내용 쓸 파일
+  local cfg="$1" out="$2" prof
+  [ -f "$cfg" ] || : >"$cfg"
+  grep -Eq '^[[:space:]]*sandbox_mode[[:space:]]*=[[:space:]]*"danger-full-access"' "$cfg" && return 1
+  prof="$(sed -nE "s/^[[:space:]]*default_permissions[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\\1/p" "$cfg" | head -n 1)"
+  if [ -n "$prof" ]; then
+    case "$prof" in
+      :*)
+        grep -Eq '^[[:space:]]*\[[[:space:]]*permissions[[:space:]]*\.[[:space:]]*edmakers' "$cfg" && return 1
+        sed -E 's/^([[:space:]]*)default_permissions[[:space:]]*=.*/\1default_permissions = "edmakers"/' "$cfg" >"$out"
+        printf '\n[permissions.edmakers]\nextends = "%s"\n[permissions.edmakers.network]\nenabled = true\n' "$prof" >>"$out"
+        return 0 ;;
+    esac
+    awk -v p="$prof" '
+      BEGIN { target = "[permissions." p ".network]"; state = 0; found = 0; has = 0 }
+      { lines[NR] = $0; h = $0; sub(/#.*/, "", h); gsub(/[ \t"\047]/, "", h)
+        if (substr(h, 1, 1) == "[") { if (state == 1) state = 2; if (h == target) { state = 1; found = NR } }
+        else if (state == 1 && h ~ /^enabled=/) has = 1 }
+      END { if (has) exit 3
+        for (i = 1; i <= NR; i++) { print lines[i]; if (i == found) print "enabled = true" }
+        if (!found) { print ""; print "[permissions.\"" p "\".network]"; print "enabled = true" } }' "$cfg" >"$out" || return 1
+    return 0
+  fi
+  grep -Eq '^[[:space:]]*\[[[:space:]]*permissions([[:space:]]|\.|\])' "$cfg" && return 1
+  grep -Eq '^[[:space:]]*network_access[[:space:]]*=[[:space:]]*true' "$cfg" && return 1
+  { printf 'default_permissions = "edmakers"\n'; cat "$cfg"
+    printf '\n[permissions.edmakers]\nextends = ":workspace"\n[permissions.edmakers.network]\nenabled = true\n'; } >"$out"
+  return 0
+}
+# 결과: ok(그대로 정상) / fixed(고침) / fail(못 고침)
+repair_codex() {  # $1 codex 실행파일
+  local cx="$1" cfg="${CODEX_HOME:-$HOME/.codex}/config.toml" backup="" state=ok err bad round tmp had
+  save_backup() { if [ -z "$backup" ] && [ -f "$cfg" ]; then backup="$cfg.edm-backup-$(date +%Y%m%d-%H%M%S)"; cp "$cfg" "$backup"; fi; }
+  round=0
+  while [ $round -lt 8 ] && err="$(codex_cfg_err "$cx")"; do
+    round=$((round+1))
+    printf 'Codex 설정 오류: %s\n' "$err" >>"$LOG"
+    save_backup; state=fixed
+    bad="$(printf '%s' "$err" | sed -nE 's/.*filesystem glob path `([^`]+)`.*/\1/p')"
+    if [ -n "$bad" ] && [ -f "$cfg" ] && codex_off_path "$cfg" "$bad"; then
+      fix "Codex 설정에서 깨진 폴더 경로 한 줄을 껐어요 ($bad)"
+    elif [ -f "$cfg" ]; then
+      rm -f "$cfg"; fix "Codex 설정 파일에 고칠 수 없는 오류가 있어 새 설정으로 시작하게 했어요"
+    else
+      break
+    fi
+  done
+  if codex_cfg_err "$cx" >/dev/null; then bad "Codex 설정 오류를 못 고쳤어요"; CODEX_CFG=fail; return 1; fi
+  if [ $state = fixed ]; then ok "Codex 설정 정상으로 돌아왔어요 (원본: $backup)"; else ok "Codex 설정 정상"; fi
+
+  mkdir -p "$(dirname "$cfg")"
+  had=0; [ -f "$cfg" ] && had=1
+  tmp="$(mktemp)"
+  if codex_net_text "$cfg" "$tmp"; then
+    save_backup
+    local before; before="$(mktemp)"; cp "$cfg" "$before"
+    cat "$tmp" >"$cfg"
+    if err="$(codex_cfg_err "$cx")"; then
+      printf '인터넷 허용 뒤 설정 오류 -> 되돌림: %s\n' "$err" >>"$LOG"
+      if [ $had = 1 ]; then cat "$before" >"$cfg"; else rm -f "$cfg"; fi
+      fix "Codex 인터넷 허용은 이 버전에 안 맞아서 건너뛰었어요"
+    else
+      fix "Codex 가 작업 중에 인터넷(깃허브·설치 명령)을 쓸 수 있게 열었어요 (작업 폴더 밖 쓰기 금지는 그대로)"
+    fi
+    rm -f "$before"
+  else
+    [ $had = 0 ] && [ ! -s "$cfg" ] && rm -f "$cfg"
+    ok "Codex 인터넷 설정 그대로 둠"
+  fi
+  rm -f "$tmp"
+  CODEX_CFG=$state
+  return 0
+}
+
 : >"$LOG"
 say "edmakers 설치기록 — $(date '+%Y-%m-%d %H:%M:%S')"
 say "맥OS $(sw_vers -productVersion 2>/dev/null) / $(uname -m) / 사용자 $(whoami)"
@@ -47,6 +184,8 @@ ${B}  ┌───────────────────────�
   │   edmakers  AI 도구 설치기               │
   │   Claude Code · Codex 를 한 번에          │
   └──────────────────────────────────────────┘${N}
+
+  ※ 끝나면 설치 기록을 강사에게 자동으로 보냅니다 (사용자 이름은 가림).
 
 EOF
 
@@ -79,25 +218,36 @@ say "${B}[2단계] 무엇을 설치할까요?${N}"
 say "   1) Claude Code"
 say "   2) Codex"
 say "   3) 둘 다"
+say "   4) 이미 깔았는데 안 켜져요 (고장 수리만)"
 pick=""
 while :; do
   pick="$(ask '   번호를 누르고 엔터: ')"
-  case "$pick" in 1|2|3) break ;; "") pick=3; break ;; esac
-  say "   1, 2, 3 중에서 골라 주세요."
+  case "$pick" in 1|2|3|4) break ;; "") pick=3; break ;; esac
+  say "   1, 2, 3, 4 중에서 골라 주세요."
 done
-WANT_CLAUDE=0; WANT_CODEX=0
-case "$pick" in 1) WANT_CLAUDE=1 ;; 2) WANT_CODEX=1 ;; 3) WANT_CLAUDE=1; WANT_CODEX=1 ;; esac
-say "   선택: $( [ $WANT_CLAUDE = 1 ] && printf 'Claude Code ' )$( [ $WANT_CODEX = 1 ] && printf 'Codex' )"
+WANT_CLAUDE=0; WANT_CODEX=0; REPAIR_ONLY=0
+case "$pick" in 1) WANT_CLAUDE=1 ;; 2) WANT_CODEX=1 ;; 3) WANT_CLAUDE=1; WANT_CODEX=1 ;; 4) REPAIR_ONLY=1; MODE=repair ;; esac
+if [ $REPAIR_ONLY = 1 ]; then
+  [ -x "$BIN_DIR/claude" ] && WANT_CLAUDE=1
+  [ -x "$BIN_DIR/codex" ] && WANT_CODEX=1
+  if [ $WANT_CLAUDE = 0 ] && [ $WANT_CODEX = 0 ] && [ -z "$(find_codex)" ]; then
+    say "   이 컴퓨터에 Claude·Codex 가 없어요. 다시 실행해서 1~3 중에 고르세요."; exit 1
+  fi
+fi
+say "   선택: $( [ $REPAIR_ONLY = 1 ] && printf '고장 수리만 · ' )$( [ $WANT_CLAUDE = 1 ] && printf 'Claude Code ' )$( [ $WANT_CODEX = 1 ] && printf 'Codex' )"
 
 # ── 3단계: 데이터 분석 도구 ───────────────────────────
-say ""
-say "${B}[3단계] 데이터 분석 도구(파이썬·pandas)도 설치할까요?${N}"
-say "   엑셀·CSV 분석 수업이면 '예'. 2~3분 더 걸려요."
-py_pick="$(ask '   y = 예, 그냥 엔터 = 아니오: ')"
 WANT_PY=0
-case "$py_pick" in y|Y|yes|예|ㅛ) WANT_PY=1 ;; esac
-[ "${EDM_WITH_PY:-0}" = 1 ] && WANT_PY=1
-say "   선택: $( [ $WANT_PY = 1 ] && echo '예' || echo '아니오' )"
+if [ $REPAIR_ONLY = 0 ]; then
+  say ""
+  say "${B}[3단계] 파이썬(데이터 분석·한글 문서 도구용)도 설치할까요?${N}"
+  say "   AI 가 파일을 다룰 때 자주 필요해서 기본은 '예'예요. 2~3분 더 걸려요."
+  py_pick="$(ask '   그냥 엔터 = 예, n = 아니오: ')"
+  WANT_PY=1
+  case "$py_pick" in n|N|no|아니*|ㅜ) WANT_PY=0 ;; esac
+  [ "${EDM_WITH_PY:-0}" = 1 ] && WANT_PY=1
+  say "   선택: $( [ $WANT_PY = 1 ] && echo '예' || echo '아니오' )"
+fi
 
 # ── 점검·자동 수정 ────────────────────────────────────
 step "설치 전에 컴퓨터를 점검하고, 문제가 있으면 바로 고칩니다"
@@ -124,9 +274,14 @@ check_net() {  # $1 주소  $2 이름
   return 1
 }
 NET_OK=1
-[ $WANT_CLAUDE = 1 ] && { check_net "https://downloads.claude.ai/claude-code-releases/latest" "Claude" || NET_OK=0; }
-[ $WANT_CODEX = 1 ]  && { check_net "https://chatgpt.com/codex/install.sh" "Codex" || NET_OK=0; }
-[ $NET_OK = 1 ] || exit 1
+if [ $REPAIR_ONLY = 0 ]; then
+  [ $WANT_CLAUDE = 1 ] && { check_net "https://downloads.claude.ai/claude-code-releases/latest" "Claude" || NET_OK=0; }
+  [ $WANT_CODEX = 1 ]  && { check_net "https://chatgpt.com/codex/install.sh" "Codex" || NET_OK=0; }
+fi
+if [ $NET_OK = 0 ]; then
+  send_report fail && say "  강사에게 기록을 보냈어요. 접수번호: ${B}$REPORT_CODE${N}"
+  exit 1
+fi
 
 # 3) 예전에 sudo 로 설치하다 생긴 '주인이 관리자인 폴더' 되돌리기
 need_own=""
@@ -194,6 +349,8 @@ for f in "$HOME/.zprofile" "$HOME/.zshrc" "$HOME/.bash_profile"; do add_path_blo
 export PATH="$BIN_DIR:$PATH"
 ok "실행 경로(PATH) 등록"
 
+GIT_PENDING=0
+if [ $REPAIR_ONLY = 0 ]; then  # ← 수리만 모드면 Node·Git·설치를 건너뛴다
 # ── 기본 도구: Node·Git ───────────────────────────────
 # Claude·Codex 자체는 Node 가 필요 없지만, 수업 중 MCP 서버·npx·git 을 쓰는 순간 막히므로 미리 깐다.
 step "기본 도구(Node·Git) 점검·설치"
@@ -281,7 +438,6 @@ install_codex_github() {
   curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=false sh
 }
 
-RES_CLAUDE=""; RES_CODEX=""
 if [ $WANT_CLAUDE = 1 ]; then
   step "Claude Code 설치"
   if run_with_retry "Claude Code" install_claude; then ok "Claude Code 설치 끝"; else bad "Claude Code 설치 실패"; fi
@@ -298,7 +454,6 @@ fi
 
 # ── 데이터 분석 도구: 파이썬 3.13 + pandas ──────────────
 # 관리자 권한 없이 uv 로 내 폴더에 파이썬을 깐다. 3.13 고정: 최신판은 pandas 가 아직 안 맞을 수 있다.
-RES_PY=""
 install_python() {
   if [ ! -x "$BIN_DIR/uv" ]; then
     curl -LsSf https://astral.sh/uv/install.sh | UV_NO_MODIFY_PATH=1 sh || return 1
@@ -314,6 +469,14 @@ install_python() {
 if [ $WANT_PY = 1 ]; then
   step "데이터 분석 도구(파이썬·pandas) 설치"
   if run_with_retry "파이썬·pandas" install_python; then ok "파이썬·pandas 설치 끝"; else bad "파이썬·pandas 설치 실패"; fi
+fi
+fi  # ← 수리만 모드 건너뛰기 끝
+
+# ── Codex 설정 점검·수리 (설치 직후 + 수리 모드) ─────────
+CX="$(find_codex)"
+if [ -n "$CX" ] && { [ $WANT_CODEX = 1 ] || [ $REPAIR_ONLY = 1 ]; }; then
+  step "Codex 설정 점검"
+  repair_codex "$CX"
 fi
 
 # ── 확인: 새 터미널을 연 것과 똑같이 찾아지는지 ────────
@@ -341,6 +504,7 @@ verify() {  # $1 명령이름  $2 표시이름
 }
 [ $WANT_CLAUDE = 1 ] && { verify claude "Claude Code" && RES_CLAUDE=ok || RES_CLAUDE=fail; }
 [ $WANT_CODEX = 1 ]  && { verify codex "Codex" && RES_CODEX=ok || RES_CODEX=fail; }
+[ "$CODEX_CFG" = fail ] && RES_CODEX=fail
 if [ $WANT_PY = 1 ]; then
   pyout="$(cd /tmp && MPLBACKEND=Agg "$BIN_DIR/python" -W error::UserWarning -c "
 import pandas, openpyxl, matplotlib.pyplot as plt, sys
@@ -363,16 +527,31 @@ say "${B}──────────────── 결과 ─────
 [ -n "$RES_PY" ]     && say "  파이썬·pandas: $( [ "$RES_PY" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
 say ""
 if [ "$RES_CLAUDE" != fail ] && [ "$RES_CODEX" != fail ] && [ "$RES_PY" != fail ]; then
-  say "  ${B}이제 이 터미널 창을 닫고(⌘Q), 새로 연 다음${N} 아래를 입력하세요."
-  [ $WANT_CLAUDE = 1 ] && say "     ${B}claude${N}"
-  [ $WANT_CODEX = 1 ]  && say "     ${B}codex${N}"
-  say ""
-  say "  처음 실행하면 브라우저가 열리면서 로그인을 물어봅니다."
+  send_report ok
+  if [ $REPAIR_ONLY = 1 ]; then
+    say "  ${B}고칠 것을 다 고쳤어요.${N} 터미널 창을 닫고(⌘Q) 새로 연 다음 claude 나 codex 를 다시 실행해 보세요."
+  else
+    say "  ${B}이제 이 터미널 창을 닫고(⌘Q), 새로 연 다음${N} 아래를 입력하세요."
+    [ $WANT_CLAUDE = 1 ] && say "     ${B}claude${N}"
+    [ $WANT_CODEX = 1 ]  && say "     ${B}codex${N}"
+    say ""
+    say "  처음 실행하면 브라우저가 열리면서 로그인을 물어봅니다."
+  fi
+  say "  나중에 안 켜지면 같은 명령을 다시 붙여넣고 4번(고장 수리)을 고르세요."
   [ "${GIT_PENDING:-0}" = 1 ] && say "  ${Y}※ Git(개발자 도구) 설치 창이 끝날 때까지 기다려 주세요.${N}"
+  [ -n "$REPORT_CODE" ] && say "  (설치 기록 접수번호: $REPORT_CODE)"
   exit 0
 else
-  say "  ${R}일부가 실패했어요.${N} 아래 기록 파일을 강사에게 보여 주세요."
-  say "     $LOG"
+  say "  ${R}일부가 실패했어요.${N}"
+  if send_report fail; then
+    say "  강사에게 기록이 자동으로 전달됐어요. 강사에게 이 번호를 알려 주세요."
+    say ""
+    say "     접수번호:  ${B}${Y}$REPORT_CODE${N}"
+  else
+    say "  아래 기록 파일을 강사에게 보여 주세요."
+    say "     $LOG"
+  fi
+  say ""
   say "  와이파이를 휴대폰 핫스팟으로 바꾸고 한 번 더 실행하면 대부분 해결됩니다."
   exit 1
 fi

@@ -14,6 +14,11 @@ try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::S
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 
 $MacCmd  = 'curl -fsSL edm.run/mac | bash'
+$Ver     = '2026-11-13'
+$ReportUrl = if ($env:EDM_REPORT_URL) { $env:EDM_REPORT_URL } else { 'https://edm.run/api/install-report' }
+$Mode    = 'install'
+$CodexCfg = ''
+$ResClaude = $null; $ResCodex = $null; $ResPy = $null
 $Log     = Join-Path $env:USERPROFILE 'edm-설치기록.txt'
 $ClaudeBin = Join-Path $env:USERPROFILE '.local\bin'
 $CodexBin  = Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin'
@@ -60,12 +65,172 @@ function Node-Major([string]$exe) {
     return 0
 }
 
+# ── Codex 설정 점검·수리 ─────────────────────────────────
+# 설치 뒤에 Codex 가 "Error loading configuration" 으로 아예 안 켜지는 일이 있다.
+# 예) 한글 폴더 이름이 '??' 로 깨져 config.toml 에 들어가면 '??' 가 와일드카드로 읽혀 거부된다.
+# Codex 자신에게 설정을 읽혀 보고(features list), 오류 문장에 찍힌 경로를 찾아 고친다.
+$Utf8NoBom = New-Object Text.UTF8Encoding($false)
+function Find-Codex {
+    $c = Join-Path $CodexBin 'codex.exe'
+    if (Test-Path -LiteralPath $c) { return $c }
+    foreach ($n in @('codex.exe', 'codex')) {
+        $g = Get-Command $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($g) { return $g.Source }
+    }
+    return $null
+}
+function Get-CodexConfigPath {
+    $h = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    return (Join-Path $h 'config.toml')
+}
+function Test-CodexConfig([string]$exe) {
+    # 판마다 문구가 다르다: 'Error loading configuration: ...' / 'Error: failed to load (bootstrap) configuration' + 'Caused by:' 아래 줄
+    $out = (& $exe features list 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    if ($out -match '(?i)error loading configuration|failed to load (bootstrap )?configuration') {
+        return ((($out -split "`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join ' / ')
+    }
+    return $null
+}
+# 'C:\Users\me\Downloads\??' 처럼 깨진 경로를 실제 한글 폴더로 되돌린다. 후보가 딱 하나일 때만.
+function Resolve-MangledPath([string]$bad) {
+    $parts = @($bad -split '[\\/]')
+    if ($parts.Count -lt 2) { return $null }
+    $cur = if ($parts[0] -eq '~') { $env:USERPROFILE } elseif ($parts[0] -eq '') { [IO.Path]::DirectorySeparatorChar.ToString() } else { $parts[0] + '\' }
+    for ($i = 1; $i -lt $parts.Count; $i++) {
+        $seg = $parts[$i]
+        if ($seg -eq '') { continue }
+        if ($seg -notmatch '[?*\[]') { $cur = Join-Path $cur $seg; continue }
+        if (-not (Test-Path -LiteralPath $cur -PathType Container)) { return $null }
+        $kids = @(Get-ChildItem -LiteralPath $cur -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '[^\x00-\x7F]' })
+        $m = @($kids | Where-Object { $_.Name -like $seg })
+        if ($m.Count -ne 1) {
+            $loose = '^' + ((($seg -split '[?*]+') | ForEach-Object { [regex]::Escape($_) }) -join '.+') + '$'
+            $m = @($kids | Where-Object { $_.Name -match $loose })
+        }
+        if ($m.Count -ne 1) { return $null }
+        $cur = Join-Path $cur $m[0].Name
+    }
+    return $cur
+}
+function Enc-Path([string]$p, [string]$k) {
+    switch ($k) { 'dbl' { return $p.Replace('\', '\\') } 'slash' { return $p.Replace('\', '/') } default { return $p } }
+}
+function Repair-GlobEntry([string]$text, [string]$bad) {
+    $real = Resolve-MangledPath $bad
+    $nl = if ($text -match "`r`n") { "`r`n" } else { "`n" }
+    $lines = @($text -split "`r?`n")
+    $changed = $false
+    foreach ($k in @('dbl', 'raw', 'slash')) {
+        $f = Enc-Path $bad $k
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $ln = $lines[$i]
+            if ($ln.TrimStart().StartsWith('#') -or -not $ln.Contains($f)) { continue }
+            if ($real) { $lines[$i] = $ln.Replace($f, (Enc-Path $real $k)) }
+            elseif ($ln -match '^\s*["'']') { $lines[$i] = '# edmakers 설치기가 끔 (깨진 경로): ' + $ln }
+            else { $lines[$i] = [regex]::Replace($ln, '\s*["'']' + [regex]::Escape($f) + '["'']\s*,?', '') }
+            $changed = $true
+        }
+        if ($changed) { break }
+    }
+    if (-not $changed) { return $null }
+    return @{ text = ($lines -join $nl); real = $real }
+}
+# Codex 는 기본으로 작업 중 인터넷을 막아서 '깃허브 연결 안 됨'·'pip 설치 실패'가 난다. 작업 폴더 밖 쓰기 금지는 그대로 두고 인터넷만 연다.
+function Get-NetworkText([string]$text) {
+    $nl = if ($text -match "`r`n") { "`r`n" } else { "`n" }
+    if ($text -match '(?m)^\s*sandbox_mode\s*=\s*"danger-full-access"') { return $null }
+    $m = [regex]::Match($text, '(?m)^(\s*)default_permissions\s*=\s*["'']([^"'']+)["''][^\r\n]*')
+    if ($m.Success) {
+        $prof = $m.Groups[2].Value
+        if ($prof.StartsWith(':')) {
+            if ($text -match '(?m)^\s*\[\s*permissions\s*\.\s*edmakers\b') { return $null }
+            $text = $text.Substring(0, $m.Index) + $m.Groups[1].Value + 'default_permissions = "edmakers"' + $text.Substring($m.Index + $m.Length)
+            return $text.TrimEnd() + "$nl$nl[permissions.edmakers]${nl}extends = `"$prof`"$nl[permissions.edmakers.network]${nl}enabled = true$nl"
+        }
+        $esc = [regex]::Escape($prof)
+        $h = [regex]::Match($text, '(?m)^\s*\[\s*permissions\s*\.\s*("' + $esc + '"|''' + $esc + '''|' + $esc + ')\s*\.\s*network\s*\][^\r\n]*')
+        if ($h.Success) {
+            $rest = $text.Substring($h.Index + $h.Length)
+            $next = [regex]::Match($rest, '(?m)^\s*\[')
+            $body = if ($next.Success) { $rest.Substring(0, $next.Index) } else { $rest }
+            if ($body -match '(?m)^\s*enabled\s*=') { return $null }
+            return $text.Insert($h.Index + $h.Length, "${nl}enabled = true")
+        }
+        return $text.TrimEnd() + "$nl$nl[permissions.`"$prof`".network]${nl}enabled = true$nl"
+    }
+    if ($text -match '(?m)^\s*\[\s*permissions\b') { return $null }
+    if ($text -match '(?m)^\s*network_access\s*=\s*true') { return $null }
+    return "default_permissions = `"edmakers`"$nl" + $text.TrimEnd() + "$nl$nl[permissions.edmakers]${nl}extends = `":workspace`"$nl[permissions.edmakers.network]${nl}enabled = true$nl"
+}
+# 결과: ok(그대로 정상) / fixed(고침) / fail(못 고침)
+function Repair-Codex([string]$exe) {
+    $cfg = Get-CodexConfigPath
+    $state = 'ok'
+    function Save-Backup { if (-not $script:cfgBackup -and (Test-Path -LiteralPath $cfg)) { $script:cfgBackup = "$cfg.edm-backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"; Copy-Item -LiteralPath $cfg $script:cfgBackup -Force } }
+    $script:cfgBackup = $null
+    for ($round = 1; $round -le 8; $round++) {
+        $err = Test-CodexConfig $exe
+        if (-not $err) { break }
+        L "Codex 설정 오류: $err"
+        Save-Backup
+        $state = 'fixed'
+        $text = if (Test-Path -LiteralPath $cfg) { [IO.File]::ReadAllText($cfg) } else { '' }
+        $r = $null
+        if ($err -match 'filesystem glob path `([^`]+)`') { $r = Repair-GlobEntry $text $Matches[1] }
+        if ($r) {
+            [IO.File]::WriteAllText($cfg, $r.text, $Utf8NoBom)
+            if ($r.real) { Fix "Codex 설정에 깨진 폴더 이름을 바로잡았어요 -> $($r.real)" } else { Fix "Codex 설정에서 깨진 폴더 경로 한 줄을 껐어요 ($($Matches[1]))" }
+        } elseif (Test-Path -LiteralPath $cfg) {
+            Remove-Item -LiteralPath $cfg -Force
+            Fix "Codex 설정 파일에 고칠 수 없는 오류가 있어 새 설정으로 시작하게 했어요"
+        } else { $round = 99 }
+    }
+    if (Test-CodexConfig $exe) { Bad "Codex 설정 오류를 못 고쳤어요"; return 'fail' }
+    if ($state -eq 'fixed') { Ok "Codex 설정 정상으로 돌아왔어요 (원본: $script:cfgBackup)" } else { Ok "Codex 설정 정상" }
+
+    $before = if (Test-Path -LiteralPath $cfg) { [IO.File]::ReadAllText($cfg) } else { $null }
+    $after = Get-NetworkText $(if ($null -ne $before) { $before } else { '' })
+    if ($null -eq $after) { Ok "Codex 인터넷 설정 그대로 둠"; L "Codex 인터넷 설정: 이미 있거나 손대지 않는 형태"; return $state }
+    Save-Backup
+    New-Item -ItemType Directory -Force -Path (Split-Path $cfg) | Out-Null
+    [IO.File]::WriteAllText($cfg, $after, $Utf8NoBom)
+    $err = Test-CodexConfig $exe
+    if ($err) {
+        L "인터넷 허용 뒤 설정 오류 -> 되돌림: $err"
+        if ($null -ne $before) { [IO.File]::WriteAllText($cfg, $before, $Utf8NoBom) } else { Remove-Item -LiteralPath $cfg -Force }
+        Fix "Codex 인터넷 허용은 이 버전에 안 맞아서 건너뛰었어요"
+    } else {
+        Fix "Codex 가 작업 중에 인터넷(깃허브·설치 명령)을 쓸 수 있게 열었어요 (작업 폴더 밖 쓰기 금지는 그대로)"
+    }
+    return $state
+}
+
+# ── 결과 보고 ────────────────────────────────────────────
+# 설치기록을 edm.run 으로 보내고 접수번호를 받는다. 사용자 이름·홈 경로는 가린다. EDM_NO_REPORT=1 이면 안 보냄.
+function St($v) { if ($null -eq $v) { '' } elseif ($v -is [string]) { $v } elseif ($v) { 'ok' } else { 'fail' } }
+function Send-Report([string]$result) {
+    if ($env:EDM_NO_REPORT -eq '1') { return $null }
+    try {
+        $txt = [IO.File]::ReadAllText($Log)
+        $txt = [regex]::Replace($txt, [regex]::Escape($env:USERPROFILE), '~', 'IgnoreCase')
+        if ($env:USERNAME -and $env:USERNAME.Length -ge 3) { $txt = [regex]::Replace($txt, [regex]::Escape($env:USERNAME), '<사용자>', 'IgnoreCase') }
+        if ($txt.Length -gt 60000) { $txt = $txt.Substring(0, 8000) + "`n...(중간 생략)...`n" + $txt.Substring($txt.Length - 50000) }
+        $qs = "os=windows&mode=$Mode&result=$result&claude=$(St $ResClaude)&codex=$(St $ResCodex)&py=$(St $ResPy)&codexcfg=$CodexCfg&ver=$Ver"
+        $code = Invoke-RestMethod -Uri "$ReportUrl`?$qs" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($txt)) -ContentType 'text/plain; charset=utf-8' -TimeoutSec 15 -UseBasicParsing
+        $code = "$code".Trim()
+        if ($code -match '^[A-Z0-9]{4,8}$') { return $code }
+    } catch { L "보고 실패: $($_.Exception.Message)" }
+    return $null
+}
+
 Clear-Host
 Write-Host ""
 Write-Host "  +------------------------------------------+" -ForegroundColor White
 Write-Host "  |   edmakers  AI 도구 설치기               |" -ForegroundColor White
 Write-Host "  |   Claude Code · Codex 를 한 번에          |" -ForegroundColor White
 Write-Host "  +------------------------------------------+" -ForegroundColor White
+Write-Host ""
+Write-Host "  ※ 끝나면 설치 기록을 강사에게 자동으로 보냅니다 (사용자 이름은 가림)." -ForegroundColor DarkGray
 Write-Host ""
 
 # ── 1단계: 컴퓨터 종류 ────────────────────────────────
@@ -90,23 +255,35 @@ Say "[2단계] 무엇을 설치할까요?" 'White'
 Say "   1) Claude Code"
 Say "   2) Codex"
 Say "   3) 둘 다"
+Say "   4) 이미 깔았는데 안 켜져요 (고장 수리만)"
 while ($true) {
     $pick = Read-Host "   번호를 누르고 엔터"
     if ($pick -eq '') { $pick = '3' }
-    if ($pick -in @('1', '2', '3')) { break }
-    Say "   1, 2, 3 중에서 골라 주세요."
+    if ($pick -in @('1', '2', '3', '4')) { break }
+    Say "   1, 2, 3, 4 중에서 골라 주세요."
 }
-$WantClaude = $pick -in @('1', '3')
-$WantCodex  = $pick -in @('2', '3')
-L "   선택: Claude=$WantClaude Codex=$WantCodex"
+$RepairOnly = $pick -eq '4'
+if ($RepairOnly) {
+    $Mode = 'repair'
+    $WantClaude = [bool]((Test-Path -LiteralPath (Join-Path $ClaudeBin 'claude.exe')) -or (Get-Command claude -ErrorAction SilentlyContinue))
+    $WantCodex  = [bool](Find-Codex)
+    if (-not ($WantClaude -or $WantCodex)) { Say "   이 컴퓨터에 Claude·Codex 가 없어요. 다시 실행해서 1~3 중에 고르세요." 'Yellow'; return }
+} else {
+    $WantClaude = $pick -in @('1', '3')
+    $WantCodex  = $pick -in @('2', '3')
+}
+L "   선택: 수리만=$RepairOnly Claude=$WantClaude Codex=$WantCodex"
 
 # ── 3단계: 데이터 분석 도구 ───────────────────────────
-Say ""
-Say "[3단계] 데이터 분석 도구(파이썬·pandas)도 설치할까요?" 'White'
-Say "   엑셀·CSV 분석 수업이면 '예'. 2~3분 더 걸려요."
-$pyPick = Read-Host "   y = 예, 그냥 엔터 = 아니오"
-$WantPy = ($pyPick -match '^(y|Y|yes|예|ㅛ)$') -or ($env:EDM_WITH_PY -eq '1')
-L "   선택: Python=$WantPy"
+$WantPy = $false
+if (-not $RepairOnly) {
+    Say ""
+    Say "[3단계] 파이썬(데이터 분석·한글 문서 도구용)도 설치할까요?" 'White'
+    Say "   AI 가 파일을 다룰 때 자주 필요해서 기본은 '예'예요. 2~3분 더 걸려요."
+    $pyPick = Read-Host "   그냥 엔터 = 예, n = 아니오"
+    $WantPy = (-not ($pyPick -match '^(n|N|no|아니|ㅜ)')) -or ($env:EDM_WITH_PY -eq '1')
+    L "   선택: Python=$WantPy"
+}
 
 # ── 점검·자동 수정 ────────────────────────────────────
 Step "설치 전에 컴퓨터를 점검하고, 문제가 있으면 바로 고칩니다"
@@ -135,6 +312,7 @@ if ($gpo) {
     Ok "스크립트 실행 정책 정상 ($eff)"
 }
 
+if (-not $RepairOnly) {
 # 2) 인터넷·학교 방화벽
 function Test-Net([string]$url, [string]$name) {
     for ($i = 1; $i -le 3; $i++) {
@@ -147,7 +325,11 @@ function Test-Net([string]$url, [string]$name) {
 $netOk = $true
 if ($WantClaude -and -not (Test-Net 'https://downloads.claude.ai/claude-code-releases/latest' 'Claude')) { $netOk = $false }
 if ($WantCodex  -and -not (Test-Net 'https://chatgpt.com/codex/install.ps1' 'Codex')) { $netOk = $false }
-if (-not $netOk) { return }
+if (-not $netOk) {
+    $c = Send-Report 'fail'
+    if ($c) { Say "  강사에게 기록을 보냈어요. 접수번호: $c" 'White' }
+    return
+}
 
 # 3) 예전 npm 설치본 정리 (경로 충돌의 주범). npm.ps1 은 실행 정책에 막힐 수 있어 npm.cmd 를 직접 부른다.
 $npmCmd = Get-Command npm.cmd -ErrorAction SilentlyContinue
@@ -367,6 +549,13 @@ if ($WantPy) {
     Add-UserPath $ClaudeBin
 }
 Refresh-SessionPath
+}  # ← 수리만 모드면 여기까지(인터넷 점검·Node·Git·설치)를 건너뛴다
+
+# ── Codex 설정 점검·수리 (설치 직후 + 수리 모드) ─────────
+if ($WantCodex) {
+    $cx = Find-Codex
+    if ($cx) { Step "Codex 설정 점검"; $CodexCfg = Repair-Codex $cx }
+}
 
 # ── 확인: 새 터미널을 연 것과 같은 순서로 찾아지는지 ───
 Step "제대로 깔렸는지 확인합니다"
@@ -390,7 +579,7 @@ function Verify([string]$cmd, [string]$label, [string]$expectDir) {
     return $true
 }
 if ($WantClaude) { $ResClaude = Verify 'claude' 'Claude Code' $ClaudeBin }
-if ($WantCodex)  { $ResCodex  = Verify 'codex' 'Codex' $CodexBin }
+if ($WantCodex)  { $ResCodex  = Verify 'codex' 'Codex' $CodexBin; if ($CodexCfg -eq 'fail') { $ResCodex = $false } }
 if ($WantPy) {
     $ResPy = $false
     if (Test-Path -LiteralPath $PyExe) {
@@ -418,15 +607,31 @@ if ($WantClaude) { if ($ResClaude) { Say "  Claude Code : 성공" 'Green' } else
 if ($WantCodex)  { if ($ResCodex)  { Say "  Codex       : 성공" 'Green' } else { Say "  Codex       : 실패" 'Red' } }
 if ($WantPy)     { if ($ResPy)     { Say "  파이썬·pandas: 성공" 'Green' } else { Say "  파이썬·pandas: 실패" 'Red' } }
 Say ""
-if (($ResClaude -ne $false) -and ($ResCodex -ne $false) -and ($ResPy -ne $false)) {
+$allOk = ($ResClaude -ne $false) -and ($ResCodex -ne $false) -and ($ResPy -ne $false)
+$code = Send-Report $(if ($allOk) { 'ok' } else { 'fail' })
+if ($allOk -and $RepairOnly) {
+    Say "  고칠 것을 다 고쳤어요. 이 창을 닫고 PowerShell 을 새로 연 다음 claude 나 codex 를 다시 실행해 보세요." 'White'
+    Say "  Codex 앱이 열려 있었다면 앱도 껐다가 다시 켜세요."
+    if ($code) { Say "  (기록 접수번호: $code)" 'DarkGray' }
+} elseif ($allOk) {
     Say "  이제 이 창을 닫고, PowerShell 을 새로 연 다음 아래를 입력하세요." 'White'
     if ($WantClaude) { Say "     claude" 'White' }
     if ($WantCodex)  { Say "     codex" 'White' }
     Say ""
     Say "  처음 실행하면 브라우저가 열리면서 로그인을 물어봅니다."
+    Say "  나중에 안 켜지면 같은 명령을 다시 붙여넣고 4번(고장 수리)을 고르세요."
+    if ($code) { Say "  (설치 기록 접수번호: $code)" 'DarkGray' }
 } else {
-    Say "  일부가 실패했어요. 아래 기록 파일을 강사에게 보여 주세요." 'Red'
-    Say "     $Log"
+    Say "  일부가 실패했어요." 'Red'
+    if ($code) {
+        Say "  강사에게 기록이 자동으로 전달됐어요. 강사에게 이 번호를 알려 주세요." 'White'
+        Say ""
+        Say "     접수번호:  $code" 'Yellow'
+    } else {
+        Say "  아래 기록 파일을 강사에게 보여 주세요."
+        Say "     $Log"
+    }
+    Say ""
     Say "  와이파이를 휴대폰 핫스팟으로 바꾸고 한 번 더 실행하면 대부분 해결됩니다."
 }
 }
