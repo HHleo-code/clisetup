@@ -17,7 +17,10 @@ VER="2026-11-13"
 REPORT_URL="${EDM_REPORT_URL:-https://edm.run/api/install-report}"
 MODE="install"
 CODEX_CFG=""
-RES_CLAUDE=""; RES_CODEX=""; RES_PY=""
+RES_CLAUDE=""; RES_CODEX=""; RES_PY=""; RES_KORDOC=""
+GH_STATE=""
+KORDOC_VER="4.24.69"
+KORDOC_HOME="$HOME/.local/share/edm-kordoc"
 
 # ── 화면 ──────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -57,7 +60,7 @@ send_report() {  # $1 ok|fail
         if (length(u) >= 3) while ((i = index($0, u)) > 0) $0 = substr($0, 1, i - 1) "<사용자>" substr($0, i + length(u))
         print }' >"$f"
   REPORT_CODE="$(curl -fsS --max-time 15 -X POST -H 'Content-Type: text/plain; charset=utf-8' --data-binary @"$f" \
-    "$REPORT_URL?os=mac&mode=$MODE&result=$1&claude=$RES_CLAUDE&codex=$RES_CODEX&py=$RES_PY&codexcfg=$CODEX_CFG&ver=$VER" 2>>"$LOG" | tr -d '[:space:]')"
+    "$REPORT_URL?os=mac&mode=$MODE&result=$1&claude=$RES_CLAUDE&codex=$RES_CODEX&py=$RES_PY&kordoc=$RES_KORDOC&gh=$GH_STATE&codexcfg=$CODEX_CFG&ver=$VER" 2>>"$LOG" | tr -d '[:space:]')"
   rm -f "$f"
   case "$REPORT_CODE" in [A-Z0-9][A-Z0-9][A-Z0-9][A-Z0-9]*) return 0 ;; esac
   REPORT_CODE=""; return 1
@@ -173,6 +176,44 @@ repair_codex() {  # $1 codex 실행파일
   return 0
 }
 
+# ── kordoc (한글 문서 도구) ───────────────────────────────
+# 수업 중에 AI 가 깃허브·npx 로 받으려다 막히지 않게, 설치할 때 내 폴더에 미리 깔고 Claude·Codex 에 등록해 둔다.
+# 글자 인식(OCR) 부품(onnxruntime, 300MB)은 빼서 교실 와이파이로도 1분 안에 받게 한다. 한글·PDF·워드 읽기/쓰기는 그대로 된다.
+install_kordoc() {
+  local npm; npm="$(PATH="$BIN_DIR:$PATH" command -v npm)" || { echo "npm 없음"; return 1; }
+  mkdir -p "$KORDOC_HOME/no-ocr" || return 1
+  printf '{"name":"onnxruntime-node","version":"0.0.0-edm","main":"index.js"}' >"$KORDOC_HOME/no-ocr/package.json"
+  printf 'throw new Error("OCR parts were left out by the edmakers installer");\n' >"$KORDOC_HOME/no-ocr/index.js"
+  printf '{"private":true,"dependencies":{"kordoc":"%s"},"overrides":{"onnxruntime-node":"file:./no-ocr"}}' "$KORDOC_VER" >"$KORDOC_HOME/package.json"
+  PATH="$BIN_DIR:$PATH" "$npm" install --prefix "$KORDOC_HOME" --no-fund --no-audit --loglevel=error || return 1
+  [ -f "$KORDOC_HOME/node_modules/kordoc/dist/cli.js" ]
+}
+# 설정 파일에서 [mcp_servers.kordoc] 표(와 그 아래 하위 표)를 뺀다
+remove_kordoc_table() {  # $1 파일 → 표준출력
+  awk '/^[ \t]*\[/ { skip = ($0 ~ /^[ \t]*\[[ \t]*mcp_servers[ \t]*\.[ \t]*["\047]?kordoc["\047]?[ \t]*(\.|\])/) } !skip' "$1"
+}
+register_kordoc_codex() {  # $1 codex  $2 node  $3 mcp.js
+  local cfg="${CODEX_HOME:-$HOME/.codex}/config.toml" before="" had=0 base extra
+  mkdir -p "$(dirname "$cfg")"
+  if [ -f "$cfg" ]; then had=1; before="$(mktemp)"; cp "$cfg" "$before"; fi
+  base="$(mktemp)"
+  if [ $had = 1 ]; then remove_kordoc_table "$before" >"$base"; fi
+  for extra in 'default_tools_approval_mode = "approve"' ''; do
+    { cat "$base"; printf "\n[mcp_servers.kordoc]\ncommand = '%s'\nargs = ['%s']\n" "$2" "$3"; [ -n "$extra" ] && printf '%s\n' "$extra"; } >"$cfg"
+    if ! err="$(codex_cfg_err "$1")"; then rm -f "$base" "$before"; return 0; fi
+    printf 'Codex kordoc 등록 뒤 설정 오류 -> 다시: %s\n' "$err" >>"$LOG"
+  done
+  if [ $had = 1 ]; then cat "$before" >"$cfg"; else rm -f "$cfg"; fi
+  rm -f "$base" "$before"; return 1
+}
+register_kordoc_claude() {  # $1 node  $2 mcp.js
+  local cl="$BIN_DIR/claude"
+  [ -x "$cl" ] || cl="$(command -v claude 2>/dev/null)" || return 1
+  "$cl" mcp remove -s user kordoc >>"$LOG" 2>&1 </dev/null
+  "$cl" mcp add -s user kordoc "$1" "$2" >>"$LOG" 2>&1 </dev/null
+  "$cl" mcp get kordoc >>"$LOG" 2>&1 </dev/null
+}
+
 : >"$LOG"
 say "edmakers 설치기록 — $(date '+%Y-%m-%d %H:%M:%S')"
 say "맥OS $(sw_vers -productVersion 2>/dev/null) / $(uname -m) / 사용자 $(whoami)"
@@ -187,6 +228,9 @@ ${B}  ┌───────────────────────�
 
   ※ 끝나면 설치 기록을 강사에게 자동으로 보냅니다 (사용자 이름은 가림).
 
+${Y}  [고르는 법] 번호 목록이 나오면, 키보드에서 원하는 숫자를 누르고
+              엔터(return) 키를 누르세요. 마우스로는 고를 수 없어요.${N}
+
 EOF
 
 # ── 1단계: 컴퓨터 종류 ────────────────────────────────
@@ -199,7 +243,7 @@ fi
 say "${B}[1단계] 어떤 컴퓨터인가요?${N}"
 say "   1) 맥 (Mac)          $( [ "$HERE" = 맥 ] && echo '← 지금 이 컴퓨터' )"
 say "   2) 윈도우 (Windows)"
-os_pick="$(ask '   번호를 누르고 엔터 (그냥 엔터 = 1): ')"
+os_pick="$(ask '   원하는 숫자를 키보드로 누르고 엔터 (지금 이 컴퓨터면 그냥 엔터): ')"
 say "   선택: ${os_pick:-1}"
 
 if [ "$os_pick" = "2" ]; then
@@ -208,8 +252,8 @@ if [ "$os_pick" = "2" ]; then
   say ""
   say "     ${B}${WIN_CMD}${N}"
   say ""
-  cont="$(ask "  이 ${HERE} 컴퓨터에 계속 설치할까요? (엔터 = 예, n = 그만): ")"
-  case "$cont" in n|N|no|아니오|아니요) say "  설치를 멈췄습니다."; exit 0 ;; esac
+  cont="$(ask "  이 ${HERE} 컴퓨터에 계속 설치할까요? (그냥 엔터 = 예 / 그만두려면 n 누르고 엔터): ")"
+  case "$cont" in n|N|no|아니*|ㅜ) say "  설치를 멈췄습니다."; exit 0 ;; esac
 fi
 
 # ── 2단계: 무엇을 설치할지 ─────────────────────────────
@@ -221,9 +265,9 @@ say "   3) 둘 다"
 say "   4) 이미 깔았는데 안 켜져요 (고장 수리만)"
 pick=""
 while :; do
-  pick="$(ask '   번호를 누르고 엔터: ')"
+  pick="$(ask '   원하는 숫자(1~4)를 키보드로 누르고 엔터 (그냥 엔터 = 3 둘 다): ')"
   case "$pick" in 1|2|3|4) break ;; "") pick=3; break ;; esac
-  say "   1, 2, 3, 4 중에서 골라 주세요."
+  say "   ${Y}키보드 위쪽 줄의 숫자 1, 2, 3, 4 중 하나를 누르고 엔터를 치세요.${N}"
 done
 WANT_CLAUDE=0; WANT_CODEX=0; REPAIR_ONLY=0
 case "$pick" in 1) WANT_CLAUDE=1 ;; 2) WANT_CODEX=1 ;; 3) WANT_CLAUDE=1; WANT_CODEX=1 ;; 4) REPAIR_ONLY=1; MODE=repair ;; esac
@@ -242,11 +286,26 @@ if [ $REPAIR_ONLY = 0 ]; then
   say ""
   say "${B}[3단계] 파이썬(데이터 분석·한글 문서 도구용)도 설치할까요?${N}"
   say "   AI 가 파일을 다룰 때 자주 필요해서 기본은 '예'예요. 2~3분 더 걸려요."
-  py_pick="$(ask '   그냥 엔터 = 예, n = 아니오: ')"
+  py_pick="$(ask '   그냥 엔터 = 예 / 싫으면 n 누르고 엔터: ')"
   WANT_PY=1
   case "$py_pick" in n|N|no|아니*|ㅜ) WANT_PY=0 ;; esac
   [ "${EDM_WITH_PY:-0}" = 1 ] && WANT_PY=1
   say "   선택: $( [ $WANT_PY = 1 ] && echo '예' || echo '아니오' )"
+fi
+
+# ── 4단계: 한글 문서 도구 kordoc ───────────────────────
+WANT_KORDOC=0
+if [ $REPAIR_ONLY = 0 ]; then
+  say ""
+  say "${B}[4단계] 한글 문서 도구(kordoc)도 미리 설치할까요?${N}"
+  say "   AI 가 한글(HWP)·PDF·워드 문서를 읽고 만들 수 있게 해 줘요. 1분쯤 더 걸려요."
+  say "   미리 깔아 두면 수업 중에 와이파이가 깃허브를 막아도 그대로 쓸 수 있어요."
+  kd_pick="$(ask '   그냥 엔터 = 예 / 싫으면 n 누르고 엔터: ')"
+  WANT_KORDOC=1
+  case "$kd_pick" in n|N|no|아니*|ㅜ) WANT_KORDOC=0 ;; esac
+  say "   선택: $( [ $WANT_KORDOC = 1 ] && echo '예' || echo '아니오' )"
+elif [ -f "$KORDOC_HOME/node_modules/kordoc/dist/mcp.js" ]; then
+  WANT_KORDOC=1  # 수리 모드: 전에 깐 kordoc 이 있으면 연결만 다시 해 둔다
 fi
 
 # ── 점검·자동 수정 ────────────────────────────────────
@@ -273,6 +332,14 @@ check_net() {  # $1 주소  $2 이름
   say "     → 학교·회사 와이파이가 막는 경우가 많아요. 휴대폰 핫스팟으로 바꾼 뒤 다시 실행하세요."
   return 1
 }
+# 깃허브 연결: 막혀도 설치는 계속한다. 수업 중 AI 가 깃허브에서 받으려 할 때 막힐 수 있다는 것만 알리고 기록에 남긴다.
+if curl -fsS -o /dev/null --max-time 10 -I https://github.com 2>>"$LOG" || curl -fsS -o /dev/null --max-time 10 -I https://github.com 2>>"$LOG"; then
+  ok "깃허브 연결됨"; GH_STATE=ok
+else
+  GH_STATE=blocked
+  fix "이 와이파이는 깃허브(github.com)를 막고 있어요. 설치는 계속합니다."
+  say "     ${Y}→ 수업 중에 AI 가 깃허브에서 뭔가 받으려 하면 실패할 수 있어요. 가능하면 휴대폰 핫스팟을 쓰세요.${N}"
+fi
 NET_OK=1
 if [ $REPAIR_ONLY = 0 ]; then
   [ $WANT_CLAUDE = 1 ] && { check_net "https://downloads.claude.ai/claude-code-releases/latest" "Claude" || NET_OK=0; }
@@ -470,6 +537,10 @@ if [ $WANT_PY = 1 ]; then
   step "데이터 분석 도구(파이썬·pandas) 설치"
   if run_with_retry "파이썬·pandas" install_python; then ok "파이썬·pandas 설치 끝"; else bad "파이썬·pandas 설치 실패"; fi
 fi
+if [ $WANT_KORDOC = 1 ]; then
+  step "한글 문서 도구(kordoc) 설치"
+  if run_with_retry "kordoc" install_kordoc; then ok "kordoc 설치 끝"; else bad "kordoc 설치 실패"; fi
+fi
 fi  # ← 수리만 모드 건너뛰기 끝
 
 # ── Codex 설정 점검·수리 (설치 직후 + 수리 모드) ─────────
@@ -477,6 +548,24 @@ CX="$(find_codex)"
 if [ -n "$CX" ] && { [ $WANT_CODEX = 1 ] || [ $REPAIR_ONLY = 1 ]; }; then
   step "Codex 설정 점검"
   repair_codex "$CX"
+fi
+
+# ── kordoc 을 Claude·Codex 에 등록 ─────────────────────
+K_JS="$KORDOC_HOME/node_modules/kordoc/dist/mcp.js"
+K_NODE=""
+if [ $WANT_KORDOC = 1 ] && [ -f "$K_JS" ]; then
+  step "kordoc 을 AI 도구에 연결"
+  K_NODE="$(PATH="$BIN_DIR:$PATH" command -v node)"
+  RES_KORDOC=ok
+  if [ $WANT_CLAUDE = 1 ]; then
+    if register_kordoc_claude "$K_NODE" "$K_JS"; then ok "Claude Code 에 kordoc 연결"; else bad "Claude Code 에 kordoc 연결 실패"; RES_KORDOC=fail; fi
+  fi
+  if [ $WANT_CODEX = 1 ]; then
+    CX="$(find_codex)"
+    if [ -n "$CX" ] && [ "$CODEX_CFG" != fail ] && register_kordoc_codex "$CX" "$K_NODE" "$K_JS"; then ok "Codex 에 kordoc 연결"; else bad "Codex 에 kordoc 연결 실패"; RES_KORDOC=fail; fi
+  fi
+elif [ $WANT_KORDOC = 1 ]; then
+  RES_KORDOC=fail
 fi
 
 # ── 확인: 새 터미널을 연 것과 똑같이 찾아지는지 ────────
@@ -516,6 +605,10 @@ print(sys.version.split()[0], pandas.__version__)" 2>&1)"; pyrc=$?; pyver="$(ech
     bad "파이썬·pandas 확인 실패"; say "$pyout" >>"$LOG"; RES_PY=fail
   fi
 fi
+if [ "$RES_KORDOC" = ok ]; then
+  kv="$("$K_NODE" "$KORDOC_HOME/node_modules/kordoc/dist/cli.js" --version 2>/dev/null | head -n 1)"
+  if [ -n "$kv" ]; then ok "kordoc  ${B}$kv${N}"; else bad "kordoc: 실행이 안 돼요"; RES_KORDOC=fail; fi
+fi
 node_now="$(PATH="$BIN_DIR:$PATH" command -v node 2>/dev/null)"
 [ -n "$node_now" ] && ok "Node  ${B}$("$node_now" -v)${N} / npm $("$(dirname "$node_now")/npm" -v 2>/dev/null)" || bad "Node: 없음"
 
@@ -525,8 +618,10 @@ say "${B}──────────────── 결과 ─────
 [ -n "$RES_CLAUDE" ] && say "  Claude Code : $( [ "$RES_CLAUDE" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
 [ -n "$RES_CODEX" ]  && say "  Codex       : $( [ "$RES_CODEX" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
 [ -n "$RES_PY" ]     && say "  파이썬·pandas: $( [ "$RES_PY" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
+[ -n "$RES_KORDOC" ] && say "  kordoc      : $( [ "$RES_KORDOC" = ok ] && echo "${G}성공${N}" || echo "${R}실패${N}" )"
+[ "$GH_STATE" = blocked ] && say "  깃허브 연결 : ${Y}막힘 (이 와이파이)${N}"
 say ""
-if [ "$RES_CLAUDE" != fail ] && [ "$RES_CODEX" != fail ] && [ "$RES_PY" != fail ]; then
+if [ "$RES_CLAUDE" != fail ] && [ "$RES_CODEX" != fail ] && [ "$RES_PY" != fail ] && [ "$RES_KORDOC" != fail ]; then
   send_report ok
   if [ $REPAIR_ONLY = 1 ]; then
     say "  ${B}고칠 것을 다 고쳤어요.${N} 터미널 창을 닫고(⌘Q) 새로 연 다음 claude 나 codex 를 다시 실행해 보세요."

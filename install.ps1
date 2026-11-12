@@ -18,12 +18,15 @@ $Ver     = '2026-11-13'
 $ReportUrl = if ($env:EDM_REPORT_URL) { $env:EDM_REPORT_URL } else { 'https://edm.run/api/install-report' }
 $Mode    = 'install'
 $CodexCfg = ''
-$ResClaude = $null; $ResCodex = $null; $ResPy = $null
+$ResClaude = $null; $ResCodex = $null; $ResPy = $null; $ResKordoc = $null
+$GhState = ''
+$KordocVer  = '4.24.69'
 $Log     = Join-Path $env:USERPROFILE 'edm-설치기록.txt'
 $ClaudeBin = Join-Path $env:USERPROFILE '.local\bin'
 $CodexBin  = Join-Path $env:LOCALAPPDATA 'Programs\OpenAI\Codex\bin'
 $NodeHome  = Join-Path $env:LOCALAPPDATA 'Programs\edm-node'
 $NpmPrefix = Join-Path $env:APPDATA 'npm'
+$KordocHome = Join-Path $env:LOCALAPPDATA 'Programs\edm-kordoc'
 $Tmp       = Join-Path $env:TEMP ("edm-setup-" + [guid]::NewGuid().ToString('N').Substring(0,8))
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 
@@ -215,12 +218,63 @@ function Send-Report([string]$result) {
         $txt = [regex]::Replace($txt, [regex]::Escape($env:USERPROFILE), '~', 'IgnoreCase')
         if ($env:USERNAME -and $env:USERNAME.Length -ge 3) { $txt = [regex]::Replace($txt, [regex]::Escape($env:USERNAME), '<사용자>', 'IgnoreCase') }
         if ($txt.Length -gt 60000) { $txt = $txt.Substring(0, 8000) + "`n...(중간 생략)...`n" + $txt.Substring($txt.Length - 50000) }
-        $qs = "os=windows&mode=$Mode&result=$result&claude=$(St $ResClaude)&codex=$(St $ResCodex)&py=$(St $ResPy)&codexcfg=$CodexCfg&ver=$Ver"
+        $qs = "os=windows&mode=$Mode&result=$result&claude=$(St $ResClaude)&codex=$(St $ResCodex)&py=$(St $ResPy)&kordoc=$(St $ResKordoc)&gh=$GhState&codexcfg=$CodexCfg&ver=$Ver"
         $code = Invoke-RestMethod -Uri "$ReportUrl`?$qs" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($txt)) -ContentType 'text/plain; charset=utf-8' -TimeoutSec 15 -UseBasicParsing
         $code = "$code".Trim()
         if ($code -match '^[A-Z0-9]{4,8}$') { return $code }
     } catch { L "보고 실패: $($_.Exception.Message)" }
     return $null
+}
+
+# ── kordoc (한글 문서 도구) ───────────────────────────────
+# 수업 중에 AI 가 깃허브·npx 로 받으려다 막히지 않게, 설치할 때 내 폴더에 미리 깔고 Claude·Codex 에 등록해 둔다.
+# 글자 인식(OCR) 부품(onnxruntime, 300MB)은 빼서 교실 와이파이로도 1분 안에 받게 한다. 한글·PDF·워드 읽기/쓰기는 그대로 된다.
+function Install-Kordoc {
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { throw "npm 이 없음 (Node 설치 실패)" }
+    $stub = Join-Path $KordocHome 'no-ocr'
+    New-Item -ItemType Directory -Force -Path $stub | Out-Null
+    [IO.File]::WriteAllText((Join-Path $stub 'package.json'), '{"name":"onnxruntime-node","version":"0.0.0-edm","main":"index.js"}', $Utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $stub 'index.js'), 'throw new Error("OCR parts were left out by the edmakers installer");', $Utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path $KordocHome 'package.json'), "{`"private`":true,`"dependencies`":{`"kordoc`":`"$KordocVer`"},`"overrides`":{`"onnxruntime-node`":`"file:./no-ocr`"}}", $Utf8NoBom)
+    & $npm.Source install --prefix $KordocHome --no-fund --no-audit --loglevel=error 2>&1 | Out-String | ForEach-Object { L $_ }
+    if ($LASTEXITCODE -ne 0) { throw "npm install 종료코드 $LASTEXITCODE" }
+    $cli = Join-Path $KordocHome 'node_modules\kordoc\dist\cli.js'
+    if (-not (Test-Path -LiteralPath $cli)) { throw "kordoc 파일이 생기지 않음" }
+}
+function Get-KordocJs { $j = Join-Path $KordocHome 'node_modules\kordoc\dist\mcp.js'; if (Test-Path -LiteralPath $j) { $j } else { $null } }
+# 설정 파일에서 [mcp_servers.kordoc] 표(와 그 아래 .env 같은 하위 표)를 뺀다
+function Remove-KordocTable([string]$text) {
+    $out = New-Object System.Collections.Generic.List[string]
+    $skip = $false
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line -match '^\s*\[') { $skip = $line -match '^\s*\[\s*mcp_servers\s*\.\s*["'']?kordoc["'']?\s*(\.|\])' }
+        if (-not $skip) { $out.Add($line) }
+    }
+    return (($out -join "`n").TrimEnd() + "`n")
+}
+function Register-KordocCodex([string]$exe, [string]$node, [string]$js) {
+    $cfg = Get-CodexConfigPath
+    $before = if (Test-Path -LiteralPath $cfg) { [IO.File]::ReadAllText($cfg) } else { $null }
+    $base = if ($null -ne $before) { Remove-KordocTable $before } else { '' }
+    $tbl = "`n[mcp_servers.kordoc]`ncommand = '$node'`nargs = ['$js']`n"
+    New-Item -ItemType Directory -Force -Path (Split-Path $cfg) | Out-Null
+    foreach ($extra in @("default_tools_approval_mode = `"approve`"`n", '')) {
+        [IO.File]::WriteAllText($cfg, ($base.TrimStart() + $tbl + $extra), $Utf8NoBom)
+        $err = Test-CodexConfig $exe
+        if (-not $err) { return $true }
+        L "Codex kordoc 등록 뒤 설정 오류 -> 다시: $err"
+    }
+    if ($null -ne $before) { [IO.File]::WriteAllText($cfg, $before, $Utf8NoBom) } else { Remove-Item -LiteralPath $cfg -Force }
+    return $false
+}
+function Register-KordocClaude([string]$node, [string]$js) {
+    $cl = Join-Path $ClaudeBin 'claude.exe'
+    if (-not (Test-Path -LiteralPath $cl)) { $g = Get-Command claude.exe -ErrorAction SilentlyContinue; if ($g) { $cl = $g.Source } else { return $false } }
+    & $cl mcp remove -s user kordoc 2>&1 | Out-String | ForEach-Object { L $_ }
+    & $cl mcp add -s user kordoc $node $js 2>&1 | Out-String | ForEach-Object { L $_ }
+    & $cl mcp get kordoc 2>&1 | Out-String | ForEach-Object { L $_ }
+    return ($LASTEXITCODE -eq 0)
 }
 
 Clear-Host
@@ -232,12 +286,15 @@ Write-Host "  +------------------------------------------+" -ForegroundColor Whi
 Write-Host ""
 Write-Host "  ※ 끝나면 설치 기록을 강사에게 자동으로 보냅니다 (사용자 이름은 가림)." -ForegroundColor DarkGray
 Write-Host ""
+Write-Host "  [고르는 법] 번호 목록이 나오면, 키보드에서 원하는 숫자를 누르고" -ForegroundColor Yellow
+Write-Host "              엔터(Enter) 키를 누르세요. 마우스로는 고를 수 없어요." -ForegroundColor Yellow
+Write-Host ""
 
 # ── 1단계: 컴퓨터 종류 ────────────────────────────────
 Say "[1단계] 어떤 컴퓨터인가요?" 'White'
 Say "   1) 맥 (Mac)"
 Say "   2) 윈도우 (Windows)     <- 지금 이 컴퓨터"
-$osPick = Read-Host "   번호를 누르고 엔터 (그냥 엔터 = 2)"
+$osPick = Read-Host "   원하는 숫자를 키보드로 누르고 엔터 (지금 이 컴퓨터면 그냥 엔터)"
 L "   선택: $osPick"
 if ($osPick -eq '1') {
     Say ""
@@ -245,8 +302,8 @@ if ($osPick -eq '1') {
     Say ""
     Say "     $MacCmd" 'White'
     Say ""
-    $cont = Read-Host "  이 윈도우 컴퓨터에 계속 설치할까요? (엔터 = 예, n = 그만)"
-    if ($cont -match '^(n|N|no|아니)') { Say "  설치를 멈췄습니다."; return }
+    $cont = Read-Host "  이 윈도우 컴퓨터에 계속 설치할까요? (그냥 엔터 = 예 / 그만두려면 n 누르고 엔터)"
+    if ($cont -match '^(n|N|no|아니|ㅜ)') { Say "  설치를 멈췄습니다."; return }
 }
 
 # ── 2단계: 무엇을 설치할지 ─────────────────────────────
@@ -257,10 +314,10 @@ Say "   2) Codex"
 Say "   3) 둘 다"
 Say "   4) 이미 깔았는데 안 켜져요 (고장 수리만)"
 while ($true) {
-    $pick = Read-Host "   번호를 누르고 엔터"
+    $pick = Read-Host "   원하는 숫자(1~4)를 키보드로 누르고 엔터 (그냥 엔터 = 3 둘 다)"
     if ($pick -eq '') { $pick = '3' }
     if ($pick -in @('1', '2', '3', '4')) { break }
-    Say "   1, 2, 3, 4 중에서 골라 주세요."
+    Say "   키보드 위쪽 줄이나 오른쪽 숫자판에서 1, 2, 3, 4 중 하나를 누르고 엔터를 치세요." 'Yellow'
 }
 $RepairOnly = $pick -eq '4'
 if ($RepairOnly) {
@@ -280,9 +337,23 @@ if (-not $RepairOnly) {
     Say ""
     Say "[3단계] 파이썬(데이터 분석·한글 문서 도구용)도 설치할까요?" 'White'
     Say "   AI 가 파일을 다룰 때 자주 필요해서 기본은 '예'예요. 2~3분 더 걸려요."
-    $pyPick = Read-Host "   그냥 엔터 = 예, n = 아니오"
+    $pyPick = Read-Host "   그냥 엔터 = 예 / 싫으면 n 누르고 엔터"
     $WantPy = (-not ($pyPick -match '^(n|N|no|아니|ㅜ)')) -or ($env:EDM_WITH_PY -eq '1')
     L "   선택: Python=$WantPy"
+}
+
+# ── 4단계: 한글 문서 도구 kordoc ───────────────────────
+$WantKordoc = $false
+if (-not $RepairOnly) {
+    Say ""
+    Say "[4단계] 한글 문서 도구(kordoc)도 미리 설치할까요?" 'White'
+    Say "   AI 가 한글(HWP)·PDF·워드 문서를 읽고 만들 수 있게 해 줘요. 1분쯤 더 걸려요."
+    Say "   미리 깔아 두면 수업 중에 와이파이가 깃허브를 막아도 그대로 쓸 수 있어요."
+    $kdPick = Read-Host "   그냥 엔터 = 예 / 싫으면 n 누르고 엔터"
+    $WantKordoc = -not ($kdPick -match '^(n|N|no|아니|ㅜ)')
+    L "   선택: kordoc=$WantKordoc"
+} elseif (Get-KordocJs) {
+    $WantKordoc = $true  # 수리 모드: 전에 깐 kordoc 이 있으면 연결만 다시 해 둔다
 }
 
 # ── 점검·자동 수정 ────────────────────────────────────
@@ -310,6 +381,20 @@ if ($gpo) {
     } catch { Fix "실행 정책을 못 바꿨어요: $($_.Exception.Message)" }
 } else {
     Ok "스크립트 실행 정책 정상 ($eff)"
+}
+
+# 깃허브 연결: 막혀도 설치는 계속한다. 수업 중 AI 가 깃허브에서 받으려 할 때 막힐 수 있다는 것만 알리고 기록에 남긴다.
+function Test-GitHub {
+    for ($i = 1; $i -le 2; $i++) {
+        try { Invoke-WebRequest -Uri 'https://github.com' -UseBasicParsing -TimeoutSec 10 -Method Head | Out-Null; return $true } catch { L "깃허브 시도 ${i}: $($_.Exception.Message)"; Start-Sleep 1 }
+    }
+    return $false
+}
+if (Test-GitHub) { Ok "깃허브 연결됨"; $GhState = 'ok' }
+else {
+    $GhState = 'blocked'
+    Fix "이 와이파이는 깃허브(github.com)를 막고 있어요. 설치는 계속합니다."
+    Say "     -> 수업 중에 AI 가 깃허브에서 뭔가 받으려 하면 실패할 수 있어요. 가능하면 휴대폰 핫스팟을 쓰세요." 'Yellow'
 }
 
 if (-not $RepairOnly) {
@@ -548,6 +633,15 @@ if ($WantPy) {
     if ($done) { Ok "파이썬·pandas 설치 끝" } else { Bad "파이썬·pandas 설치 실패" }
     Add-UserPath $ClaudeBin
 }
+if ($WantKordoc) {
+    Step "한글 문서 도구(kordoc) 설치"
+    $done = $false
+    for ($i = 1; $i -le 3 -and -not $done; $i++) {
+        Say "  . kordoc 설치 중... (시도 $i/3, 1분쯤 걸려요)"
+        try { Install-Kordoc; $done = $true } catch { L "kordoc 시도 $i 실패: $($_.Exception.Message)"; Start-Sleep 3 }
+    }
+    if ($done) { Ok "kordoc 설치 끝" } else { Bad "kordoc 설치 실패" }
+}
 Refresh-SessionPath
 }  # ← 수리만 모드면 여기까지(인터넷 점검·Node·Git·설치)를 건너뛴다
 
@@ -556,6 +650,22 @@ if ($WantCodex) {
     $cx = Find-Codex
     if ($cx) { Step "Codex 설정 점검"; $CodexCfg = Repair-Codex $cx }
 }
+
+# ── kordoc 을 Claude·Codex 에 등록 ─────────────────────
+if ($WantKordoc -and (Get-KordocJs)) {
+    Step "kordoc 을 AI 도구에 연결"
+    $kNode = Resolve-NewTerminal 'node'
+    if (-not $kNode) { $g = Get-Command node.exe -ErrorAction SilentlyContinue; if ($g) { $kNode = $g.Source } }
+    $kJs = Get-KordocJs
+    $ResKordoc = $true
+    if ($WantClaude) {
+        if (Register-KordocClaude $kNode $kJs) { Ok "Claude Code 에 kordoc 연결" } else { Bad "Claude Code 에 kordoc 연결 실패"; $ResKordoc = $false }
+    }
+    if ($WantCodex) {
+        $cx = Find-Codex
+        if ($cx -and $CodexCfg -ne 'fail' -and (Register-KordocCodex $cx $kNode $kJs)) { Ok "Codex 에 kordoc 연결" } else { Bad "Codex 에 kordoc 연결 실패"; $ResKordoc = $false }
+    }
+} elseif ($WantKordoc) { $ResKordoc = $false }
 
 # ── 확인: 새 터미널을 연 것과 같은 순서로 찾아지는지 ───
 Step "제대로 깔렸는지 확인합니다"
@@ -596,6 +706,10 @@ if ($WantPy) {
         if ($hit -and -not $hit.StartsWith($ClaudeBin, [StringComparison]::OrdinalIgnoreCase)) { Fix "새 창에서 다른 파이썬($hit)이 먼저 잡혀요. 'py' 대신 'python' 으로 쓰면 이 컴퓨터의 다른 파이썬이 실행될 수 있어요." }
     } else { Bad "파이썬: 실행 파일이 없어요" }
 }
+if ($WantKordoc -and $ResKordoc) {
+    $kv = & $kNode (Join-Path $KordocHome 'node_modules\kordoc\dist\cli.js') --version 2>$null | Select-Object -First 1
+    if ($kv) { Ok "kordoc  $kv" } else { Bad "kordoc: 실행이 안 돼요"; $ResKordoc = $false }
+}
 $n = Resolve-NewTerminal 'node'
 if ($n) { Ok "Node  $(& $n -v)" } else { Bad "Node: 없음" }
 
@@ -606,8 +720,10 @@ Say "---------------- 결과 ----------------" 'White'
 if ($WantClaude) { if ($ResClaude) { Say "  Claude Code : 성공" 'Green' } else { Say "  Claude Code : 실패" 'Red' } }
 if ($WantCodex)  { if ($ResCodex)  { Say "  Codex       : 성공" 'Green' } else { Say "  Codex       : 실패" 'Red' } }
 if ($WantPy)     { if ($ResPy)     { Say "  파이썬·pandas: 성공" 'Green' } else { Say "  파이썬·pandas: 실패" 'Red' } }
+if ($WantKordoc) { if ($ResKordoc) { Say "  kordoc      : 성공" 'Green' } else { Say "  kordoc      : 실패" 'Red' } }
+if ($GhState -eq 'blocked') { Say "  깃허브 연결 : 막힘 (이 와이파이)" 'Yellow' }
 Say ""
-$allOk = ($ResClaude -ne $false) -and ($ResCodex -ne $false) -and ($ResPy -ne $false)
+$allOk = ($ResClaude -ne $false) -and ($ResCodex -ne $false) -and ($ResPy -ne $false) -and ($ResKordoc -ne $false)
 $code = Send-Report $(if ($allOk) { 'ok' } else { 'fail' })
 if ($allOk -and $RepairOnly) {
     Say "  고칠 것을 다 고쳤어요. 이 창을 닫고 PowerShell 을 새로 연 다음 claude 나 codex 를 다시 실행해 보세요." 'White'
